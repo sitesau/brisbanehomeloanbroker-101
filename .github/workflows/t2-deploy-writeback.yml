@@ -253,6 +253,9 @@ jobs:
           live_url="${{ steps.verify.outputs.live_url }}"
           wheel_id="${{ steps.meta.outputs.wheel_id }}"
           rest="$SUPABASE_URL/rest/v1"
+          echo "DEBUG url-len=${#SUPABASE_URL} url-hex=$(echo -n "$SUPABASE_URL" | od -An -tx1 | tr -d ' \n')"
+          getent hosts "$(echo "$SUPABASE_URL" | sed -E 's#https?://([^/]+).*#\1#')" || echo "DEBUG getent failed"
+          curl -sv -o /dev/null -m 10 "$SUPABASE_URL" 2>&1 | head -20 || true
           # deploy.* tables live outside PostgREST's default 'public' schema —
           # Accept-Profile (GET/DELETE) / Content-Profile (POST/PATCH) select it.
           auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
