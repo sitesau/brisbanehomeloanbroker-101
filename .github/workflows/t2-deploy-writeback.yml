@@ -45,6 +45,8 @@ jobs:
   writeback:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write  # ghpages deploy step pushes a gh-pages branch to THIS repo
     steps:
       - uses: actions/checkout@v4
 
