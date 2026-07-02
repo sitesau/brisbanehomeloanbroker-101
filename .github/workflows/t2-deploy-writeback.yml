@@ -1,0 +1,272 @@
+name: t2-deploy-writeback
+
+# Fires after Hermes commits+pushes a built T2 feeder site (raw HTML at repo
+# root). THIS ACTION DEPLOYS IT -- Hermes holds no host credentials, only a
+# git-write SSH key (blast radius = git-write only if the VPS is compromised).
+# Host creds live in this repo's Action secrets. After deploy, polls for a
+# real HTTP 200, then does the DB writeback. NEVER writes DB before a
+# confirmed-live check (evidence gate — see docs/system/t2plus-automation-spec.md
+# §6.0, 2026-07-01 bake-off finding: a free model called wheel-done having
+# built nothing).
+#
+# Expects at repo root, written by Hermes at build/commit time:
+#   .wheel-meta.json  — { wheel_id, slug, project, parent_t1_ref, money_target,
+#                          primary_kw, intended_url,
+#                          links: [{ target_url, anchor, rel }, ...] }
+#     project = the pretty subdomain/site name (e.g. "garage-door-repair-guide"
+#     for garage-door-repair-guide.netlify.app) -- intended_url MUST match what
+#     that project name resolves to on the target host.
+#   .deploy-host      — plain text, one of: netlify | vercel | s3 | cloudflare | ghpages
+#     (gcs is NOT wired -- blocked by a GCP org policy that disallows service-account
+#     key creation; would need Workload Identity Federation instead, not built. Do
+#     not route a node to gcs until that's done.)
+#   <32-hex>.txt      — the IndexNow key file (same convention as the local
+#     deploy-cloud.sh pipeline: filename IS the key, content IS the key, must
+#     be reachable at <live-url-host>/<key>.txt). Reuse the same key across a
+#     node's redeploys if one already exists; generate fresh only for a new
+#     node. WITHOUT this file the Action skips IndexNow submission silently
+#     (logged, not a failure) -- Bing/Yandex/DuckDuckGo will not get pinged.
+#     s3/gcs (path hosts) never got IndexNow even in the old pipeline -- RapidURL only.
+#
+# Host secrets required per repo (pushed once at repo-create time), all now pushed
+# to every sitesau cloudsite repo (2026-07-02):
+#   netlify    -> NETLIFY_AUTH_TOKEN
+#   vercel     -> VERCEL_TOKEN
+#   s3         -> AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
+#   cloudflare -> CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID (mambaqld account)
+#   ghpages    -> none beyond the Action's own GITHUB_TOKEN (native GH Pages on
+#                 THIS repo, enabled via API on first deploy, idempotent)
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  writeback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read wheel meta
+        id: meta
+        run: |
+          # Not every push to this repo is a Hermes T2 build (content tweaks,
+          # manual fixes, etc). No .wheel-meta.json -> clean no-op, not a
+          # failure -- otherwise every unrelated push spams a failure email.
+          if [ ! -f .wheel-meta.json ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No .wheel-meta.json on this push -- not a Hermes T2 build, skipping writeback."
+            exit 0
+          fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "wheel_id=$(jq -r '.wheel_id' .wheel-meta.json)"
+            echo "slug=$(jq -r '.slug' .wheel-meta.json)"
+            echo "project=$(jq -r '.project // .slug' .wheel-meta.json)"
+            echo "parent_t1_ref=$(jq -r '.parent_t1_ref' .wheel-meta.json)"
+            echo "money_target=$(jq -r '.money_target // ""' .wheel-meta.json)"
+            echo "primary_kw=$(jq -r '.primary_kw // ""' .wheel-meta.json)"
+            echo "intended_url=$(jq -r '.intended_url' .wheel-meta.json)"
+          } >> "$GITHUB_OUTPUT"
+          echo "cloud_host=$(cat .deploy-host | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+          jq -c '.links // []' .wheel-meta.json > /tmp/links.json
+
+      - name: Deploy (netlify)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'netlify'
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        run: |
+          npm install -g netlify-cli
+          PROJECT="${{ steps.meta.outputs.project }}"
+          SID="$(netlify api listSites | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}' || true)"
+          if [ -z "$SID" ]; then
+            netlify sites:create --name "$PROJECT" --account-slug sites-au
+            SID="$(netlify api listSites | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}')"
+          fi
+          [ -n "$SID" ] || { echo "::error::could not resolve Netlify site id for '$PROJECT' in account sites-au"; exit 1; }
+          netlify deploy --prod --dir=. --site="$SID"
+
+      - name: Deploy (vercel)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'vercel'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          npm install -g vercel
+          PROJECT="${{ steps.meta.outputs.project }}"
+          DEP_URL="$(vercel deploy --prod --yes --token="$VERCEL_TOKEN" --scope=site-au --name="$PROJECT" | tail -1 | tr -d '\r')"
+          [ -n "$DEP_URL" ] || { echo "::error::vercel deploy produced no URL for '$PROJECT' in scope site-au"; exit 1; }
+          vercel alias set "$DEP_URL" "$PROJECT.vercel.app" --token="$VERCEL_TOKEN" --scope=site-au
+
+      - name: Deploy (s3)
+        # Bucket = project name (mirrors _scripts/deploy_s3.py convention). Public-read
+        # static website hosting; URL is the S3 website endpoint.
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 's3'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+        run: |
+          PROJECT="${{ steps.meta.outputs.project }}"
+          aws s3api head-bucket --bucket "$PROJECT" 2>/dev/null || {
+            aws s3api create-bucket --bucket "$PROJECT" --region "$AWS_DEFAULT_REGION" \
+              --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
+            aws s3api put-public-access-block --bucket "$PROJECT" --public-access-block-configuration \
+              BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false
+            aws s3api put-bucket-policy --bucket "$PROJECT" --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"PublicRead\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$PROJECT/*\"}]}"
+            aws s3 website "s3://$PROJECT" --index-document index.html
+          }
+          # Path host convention: the built HTML file is keyword-named (e.g.
+          # bathroom-renovation-cost-camberwell.html), NOT necessarily index.html
+          # -- upload whatever .html exists at repo root, matching intended_url.
+          for f in *.html; do
+            [ -e "$f" ] && aws s3 cp "$f" "s3://$PROJECT/$f" --content-type text/html
+          done
+          for f in *.jpg *.png *.txt *.xml; do
+            [ -e "$f" ] && [[ "$f" != .* ]] && aws s3 cp "$f" "s3://$PROJECT/$f" 2>/dev/null || true
+          done
+
+      - name: Deploy (cloudflare pages)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'cloudflare'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npm install -g wrangler
+          PROJECT="${{ steps.meta.outputs.project }}"
+          npx wrangler pages project create "$PROJECT" --production-branch=main || true
+          npx wrangler pages deploy . --project-name="$PROJECT" --branch=main --commit-dirty=true
+
+      - name: Deploy (github pages)
+        # Native GH Pages on THIS repo (no external host account needed). Enables
+        # Pages via the API (idempotent) then pushes content to a gh-pages branch.
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'ghpages'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sf -X POST "https://api.github.com/repos/${{ github.repository }}/pages" \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -d '{"source":{"branch":"gh-pages","path":"/"}}' >/dev/null 2>&1 || true
+          rm -rf /tmp/ghpages-deploy && mkdir /tmp/ghpages-deploy
+          cp -r ./* /tmp/ghpages-deploy/ 2>/dev/null
+          rm -rf /tmp/ghpages-deploy/.git
+          cd /tmp/ghpages-deploy
+          git init -q -b gh-pages
+          git -c user.name=hermes-t2 -c user.email=hermes@sitesau.local add -A
+          git -c user.name=hermes-t2 -c user.email=hermes@sitesau.local commit -q -m "deploy"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages:gh-pages
+
+      - name: Deploy (gcs -- blocked, org policy)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'gcs'
+        run: |
+          echo "::error::cloud_host=gcs is blocked -- GCP org policy disallows service-account key creation. Needs Workload Identity Federation instead (not built). Do not route T2 builds to gcs until this is fixed."
+          exit 1
+
+      - name: Poll live URL for HTTP 200 (evidence gate)
+        if: steps.meta.outputs.present == 'true'
+        id: verify
+        run: |
+          url="${{ steps.meta.outputs.intended_url }}"
+          code=0
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "live_url=$url" >> "$GITHUB_OUTPUT"
+              echo "http_code=200" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "http_code=$code" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: IndexNow submit (Bing/Yandex/DuckDuckGo, free)
+        # Mirrors deploy-cloud.sh's convention: a 32-hex-named .txt file at
+        # repo root IS the IndexNow key (must be reachable at <host>/<key>.txt).
+        # Hermes must commit this file alongside the built HTML -- if it's
+        # missing, submission is skipped (logged, not a failure) rather than
+        # generating+committing a key mid-Action.
+        if: steps.meta.outputs.present == 'true' && success()
+        run: |
+          KEY_FILE="$(ls *.txt 2>/dev/null | grep -iE '^[0-9a-f]{32}\.txt$' | head -1 || true)"
+          if [ -z "$KEY_FILE" ]; then
+            echo "No IndexNow key .txt at repo root -- skipping submission. Hermes should commit one (see t2-deploy-writeback.yml header)."
+            exit 0
+          fi
+          KEY="$(basename "$KEY_FILE" .txt)"
+          url="${{ steps.verify.outputs.live_url }}"
+          host="$(echo "$url" | sed -E 's#https?://([^/]+).*#\1#')"
+          for ep in https://api.indexnow.org/indexnow https://www.bing.com/indexnow https://yandex.com/indexnow; do
+            curl -s -o /dev/null -m 20 "$ep?url=$url&key=$KEY&keyLocation=https://$host/$KEY.txt" || true
+          done
+          echo "IndexNow submitted for $url"
+
+      - name: Writeback (live confirmed)
+        if: steps.meta.outputs.present == 'true' && success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          slug="${{ steps.meta.outputs.slug }}"
+          parent="${{ steps.meta.outputs.parent_t1_ref }}"
+          money="${{ steps.meta.outputs.money_target }}"
+          kw="${{ steps.meta.outputs.primary_kw }}"
+          host="${{ steps.meta.outputs.cloud_host }}"
+          live_url="${{ steps.verify.outputs.live_url }}"
+          wheel_id="${{ steps.meta.outputs.wheel_id }}"
+          rest="$SUPABASE_URL/rest/v1"
+          # deploy.* tables live outside PostgREST's default 'public' schema —
+          # Accept-Profile (GET/DELETE) / Content-Profile (POST/PATCH) select it.
+          auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+                -H "Content-Type: application/json" -H "Accept-Profile: deploy" -H "Content-Profile: deploy")
+
+          # 1. cloud_properties upsert (tier=T2, links_up_to=parent T1, never money)
+          curl -sf -X POST "$rest/cloud_properties" \
+            "${auth[@]}" -H "Prefer: resolution=merge-duplicates,return=minimal" \
+            -d @- <<JSON
+          {"slug":"$slug","money_target":"$money","cloud_host":"$host","intended_url":"$live_url",
+           "live_url":"$live_url","primary_kw":"$kw","tier":"T2","links_up_to":"$parent",
+           "method":"cloudlink-t2-wheel","status":"live"}
+          JSON
+
+          # 2. link_edges feed-replace (source_feed=t2-wheel, this slug only)
+          curl -sf -X DELETE "$rest/link_edges?source_ref=eq.$slug&source_feed=eq.t2-wheel" "${auth[@]}"
+
+          jq -c --arg slug "$slug" --arg url "$live_url" \
+            '[.[] | {source_url:$url, target_url:.target_url, source_type:"cloud", source_ref:$slug, target_type:"cloud", anchor:.anchor, rel:(.rel // "follow"), source_feed:"t2-wheel", first_seen: (now|strftime("%Y-%m-%d"))}]' \
+            /tmp/links.json > /tmp/link_edges.json
+
+          if [ "$(jq 'length' /tmp/link_edges.json)" -gt 0 ]; then
+            curl -sf -X POST "$rest/link_edges" "${auth[@]}" -H "Prefer: resolution=merge-duplicates,return=minimal" \
+              -d @/tmp/link_edges.json
+          fi
+
+          # 3. t2_build_queue: append this slug to built_slugs, flip done only
+          #    once feeder_count is met (structure may need multiple pushes).
+          row=$(curl -sf "$rest/t2_build_queue?id=eq.$wheel_id&select=built_slugs,feeder_count" "${auth[@]}")
+          built=$(echo "$row" | jq -c --arg s "$slug" '.[0].built_slugs + [$s] | unique')
+          feeder_count=$(echo "$row" | jq -r '.[0].feeder_count')
+          count=$(echo "$built" | jq 'length')
+          if [ "$count" -ge "$feeder_count" ]; then
+            status="done"; done_at_clause=",\"done_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+          else
+            status="in_progress"; done_at_clause=""
+          fi
+          curl -sf -X PATCH "$rest/t2_build_queue?id=eq.$wheel_id" "${auth[@]}" -H "Prefer: return=minimal" \
+            -d "{\"built_slugs\":$built,\"status\":\"$status\",\"error\":null$done_at_clause}"
+
+      - name: Mark failed (deploy or live-check never passed)
+        # Broader than "verify failed" -- also catches a deploy step failure
+        # (verify never even ran, steps.verify.outcome would be 'skipped').
+        if: steps.meta.outputs.present == 'true' && failure()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          wheel_id="${{ steps.meta.outputs.wheel_id }}"
+          code="${{ steps.verify.outputs.http_code }}"
+          reason="${code:-deploy step failed, see Action run log}"
+          curl -sf -X PATCH "$SUPABASE_URL/rest/v1/t2_build_queue?id=eq.$wheel_id" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" -H "Content-Profile: deploy" -H "Prefer: return=minimal" \
+            -d "{\"status\":\"failed\",\"error\":\"$reason\"}"

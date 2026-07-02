@@ -1,0 +1,12 @@
+{
+  "wheel_id": 27,
+  "slug": "brisbanehomeloanbroker-101",
+  "project": "brisbanehomeloanbroker-101",
+  "parent_t1_ref": "brisbanehomeloanbroker-002",
+  "money_target": "brisbanehomeloanbroker.com.au",
+  "primary_kw": "first home buyer grant brisbane",
+  "intended_url": "https://sitesau.github.io/brisbanehomeloanbroker-101/",
+  "links": [
+    {"target_url": "https://brisbanehomeloanbroker-002.s3.ap-southeast-2.amazonaws.com/first-home-buyer-loans-brisbane.html", "anchor": "first home buyer loans in Brisbane", "rel": "follow"}
+  ]
+}
